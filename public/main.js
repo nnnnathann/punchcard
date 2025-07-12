@@ -5,7 +5,6 @@ class LoginWithGoogle extends HTMLElement {
   // ——— Replace these with your real values ———
   static CLIENT_ID =
     "1016583805708-6f9si6f88jcv7v8novm336he5ngvjg0s.apps.googleusercontent.com";
-  static API_KEY = "AIzaSyBA--9PYfcnM2k_Lgk0t31t3oWvpJigv_M";
   static DISCOVERY_DOCS = [
     "https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest",
   ];
@@ -20,7 +19,6 @@ class LoginWithGoogle extends HTMLElement {
     super();
     this.attachShadow({ mode: "open" });
 
-    // 1) Watch Firebase auth
     firebase.auth().onAuthStateChanged((user) => {
       this.#loading = false;
       this.#user = user;
@@ -32,33 +30,17 @@ class LoginWithGoogle extends HTMLElement {
           composed: true,
         }),
       );
-      // If everything else is ready, kick off token request:
       this._maybeRequestAccessToken();
     });
 
-    this.shadowRoot.innerHTML = html`
+    this.shadowRoot.innerHTML = /* html */ `
       <style>
-        :host {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          font-family: Arial, sans-serif;
-          width: 100%;
-          padding: 10px;
-        }
-        button {
-          padding: 8px 12px;
-          font-size: 16px;
-          cursor: pointer;
-        }
-        #user-info {
-          display: flex;
-          align-items: center;
-          gap: 10px;
-        }
-        #user-info div {
-          font-weight: bold;
-        }
+        :host { display: flex; justify-content: space-between;
+                 align-items: center; font-family: Arial, sans-serif;
+                 width: 100%; padding: 10px; }
+        button { padding: 8px 12px; font-size: 16px; cursor: pointer; }
+        #user-info { display: flex; align-items: center; gap: 10px; }
+        #user-info div { font-weight: bold; }
       </style>
       <div>Punchcard</div>
       <div id="content"></div>
@@ -71,26 +53,25 @@ class LoginWithGoogle extends HTMLElement {
     this._initGis();
   }
 
-  // ——— load & init gapi.client ———
+  // ——— Load & init gapi.client for Calendar ———
   _initGapiClient() {
-    gapi.load("client", () => {
-      gapi.client
-        .init({
-          apiKey: LoginWithGoogle.API_KEY,
-          discoveryDocs: LoginWithGoogle.DISCOVERY_DOCS,
-        })
-        .then(() => {
-          this.#gapiReady = true;
-          console.log("🟢 gapi.client ready");
-          this._maybeRequestAccessToken();
-        })
-        .catch((err) => console.error("❌ gapi.client.init error", err));
-    });
+    if (window.gapi) {
+      gapi.load("client", () => {
+        gapi.client
+          .init({
+            discoveryDocs: LoginWithGoogle.DISCOVERY_DOCS,
+          })
+          .then(() => {
+            this.#gapiReady = true;
+            this._maybeRequestAccessToken();
+          })
+          .catch((err) => console.error("gapi.client.init error", err));
+      });
+    }
   }
 
-  // ——— load & init GIS ———
+  // ——— Load & init GIS for ID + Access tokens ———
   _initGis() {
-    // load script if needed
     if (!window.google?.accounts?.id) {
       const s = document.createElement("script");
       s.src = "https://accounts.google.com/gsi/client";
@@ -101,27 +82,23 @@ class LoginWithGoogle extends HTMLElement {
       return;
     }
 
-    // ID-token → callback
     google.accounts.id.initialize({
       client_id: LoginWithGoogle.CLIENT_ID,
       callback: (resp) => this._handleCredentialResponse(resp),
     });
 
-    // prepare access-token client
     this.#tokenClient = google.accounts.oauth2.initTokenClient({
       client_id: LoginWithGoogle.CLIENT_ID,
       scope: LoginWithGoogle.SCOPES,
       callback: (tokenResp) => this._handleTokenResponse(tokenResp),
     });
 
-    console.log("🟢 GIS ready, tokenClient:", this.#tokenClient);
     this._maybeRequestAccessToken();
   }
 
-  // ——— if user + gapi + tokenClient are all set, request the token ———
+  // ——— If signed-in + gapi + tokenClient ready → request token ———
   _maybeRequestAccessToken() {
-    if (this.#user && this.#gapiReady && this.#tokenClient) {
-      console.log("➡️ Already logged in – requesting Calendar token");
+    if (this.#user && this.#tokenClient) {
       this.#tokenClient.requestAccessToken({ prompt: "" });
     }
   }
@@ -142,21 +119,21 @@ class LoginWithGoogle extends HTMLElement {
       this.shadowRoot.getElementById("gis-button"),
       { theme: "outline", size: "large" },
     );
-    google.accounts.id.prompt(); // optional one-tap
+    google.accounts.id.prompt();
   }
 
   async _handleCredentialResponse(response) {
-    console.log("➡️ Got ID token", response);
     const idToken = response.credential;
     const cred = firebase.auth.GoogleAuthProvider.credential(idToken);
-    const { user } = await firebase.auth().signInWithCredential(cred);
-    // Firebase onAuthStateChanged will fire, calling _maybeRequestAccessToken()
+    await firebase.auth().signInWithCredential(cred);
   }
 
   _handleTokenResponse(tokenResponse) {
-    console.log("⬅️ Received access token", tokenResponse);
     const accessToken = tokenResponse.access_token;
-    gapi.client.setToken({ access_token: accessToken });
+    window.calendarAccessToken = accessToken;
+    if (this.#gapiReady) {
+      gapi.client.setToken({ access_token: accessToken });
+    }
     this.dispatchEvent(
       new CustomEvent("gapi-login", {
         detail: { user: this.#user, accessToken },
