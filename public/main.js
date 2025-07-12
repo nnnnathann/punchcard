@@ -124,6 +124,12 @@ class PunchcardApp extends HTMLElement {
   }
   set user(user) {
     this.#user = user;
+    // configure gapi client
+    if (user) {
+      gapi.load("client", () => {
+        gapi.client.init({});
+      });
+    }
     this.render();
   }
   get user() {
@@ -134,6 +140,7 @@ customElements.define("punchcard-app", PunchcardApp);
 
 class CalendarSummary extends HTMLElement {
   #loading = true;
+  #error = false;
   #events = null;
   constructor() {
     super();
@@ -179,28 +186,52 @@ class CalendarSummary extends HTMLElement {
     this.render();
   }
   connectedCallback() {
-    this.fetchCalendarData();
+    this.fetchCalendarData(oneMonthAgo(), today());
     this.render();
   }
   disconnectedCallback() {
     // Cleanup if needed
   }
-  fetchCalendarData() {
+  fetchCalendarData(startDate, endDate) {
     this.#loading = true;
-    // Simulate fetching calendar data
-    setTimeout(() => {
-      this.#loading = false;
-      this.#events = [
-        { title: "Meeting with Bob", date: "2023-10-01" },
-        { title: "Project deadline", date: "2023-10-05" },
-        { title: "Conference", date: "2023-10-10" },
-      ];
-      this.render();
-    }, 1000);
+    const startDateEl = this.shadowRoot.querySelector("#start-date");
+    const endDateEl = this.shadowRoot.querySelector("#end-date");
+    if (!startDate) {
+      startDate = new Date(startDateEl?.value) || oneMonthAgo();
+    }
+    if (!endDate) {
+      endDate = new Date(endDateEl?.value) || today();
+    }
+    if (startDateEl) {
+      startDateEl.value = startDate.toISOString().split("T")[0];
+    }
+    if (endDateEl) {
+      endDateEl.value = endDate.toISOString().split("T")[0];
+    }
+    this.render();
+    fetchGoogleCalendarEvents(startDate, endDate)
+      .then((events) => {
+        this.#events = events;
+        this.#loading = false;
+        this.#error = false;
+        this.render();
+      })
+      .catch((error) => {
+        console.error("Error fetching calendar events:", error);
+        this.#loading = false;
+        this.#error = true;
+        this.#events = null;
+        this.render();
+      });
   }
   render() {
     if (this.#loading) {
       this.renderLoading();
+      return;
+    } else if (this.#error) {
+      this.renderContent(
+        "<p>Error loading calendar data. Please try again later.</p>"
+      );
       return;
     } else if (!this.#events) {
       this.renderNoEvents();
@@ -217,41 +248,7 @@ class CalendarSummary extends HTMLElement {
     this.renderContent("<p>No events found.</p>");
   }
   renderEvents() {
-    const events = [
-      {
-        title: "[v1] [meeting] ACHQC Data",
-        date: ["2025-07-01T00:00:00Z", "2025-07-01T23:59:59Z"],
-      },
-      // more like that
-      {
-        title: "[v1] [pd] DOS",
-        date: ["2025-07-02T14:15:00Z", "2025-07-02T15:00:00Z"],
-      },
-      {
-        title: "[v2] [meeting] Standup",
-        date: ["2025-07-03T14:15:00Z", "2025-07-03T15:00:00Z"],
-      },
-      {
-        title: "[v2] [pd] Project X",
-        date: ["2025-07-04T14:15:00Z", "2025-07-04T15:00:00Z"],
-      },
-      {
-        title: "[v1] [meeting] Sprint Planning",
-        date: ["2025-07-05T14:15:00Z", "2025-07-05T15:00:00Z"],
-      },
-      {
-        title: "[v1] [pd] Feature Y",
-        date: ["2025-07-06T14:15:00Z", "2025-07-06T15:00:00Z"],
-      },
-      {
-        title: "[v1] [meeting] Retrospective",
-        date: ["2025-07-07T14:15:00Z", "2025-07-07T15:00:00Z"],
-      },
-      {
-        title: "[v1] [pd] Bug Fixes",
-        date: ["2025-07-08T14:15:00Z", "2025-07-08T15:00:00Z"],
-      },
-    ];
+    const events = this.#events;
     const summary = calculateSummary(events);
     const content = summary
       .map((tag) => {
@@ -270,24 +267,20 @@ class CalendarSummary extends HTMLElement {
         </div>`;
       })
       .join("");
-    const startDate = oneMonthAgo();
-    const endDate = today();
     this.renderContent(html`
       <div id="summary">
         <h2>Events by Tag (calendar: &quot;punchcard&quot;)</h2>
         <div class="date-range">
           <input type="date" id="start-date" disabled />
           <input type="date" id="end-date" disabled />
+          <button id="refresh">Refresh</button>
         </div>
         ${content}
       </div>
     `);
-    this.shadowRoot.querySelector("#start-date").value = startDate
-      .toISOString()
-      .split("T")[0];
-    this.shadowRoot.querySelector("#end-date").value = endDate
-      .toISOString()
-      .split("T")[0];
+    this.shadowRoot.querySelector("#refresh").addEventListener("click", () => {
+      this.fetchCalendarData();
+    });
   }
   renderContent(content) {
     this.shadowRoot.querySelector("#content").innerHTML = content;
@@ -393,4 +386,83 @@ function oneMonthAgo() {
 
 function today() {
   return new Date();
+}
+
+async function fetchGoogleCalendarEvents(startDate, endDate) {
+  return fetchGoogleCalendarEventsReal(startDate, endDate);
+}
+
+async function fetchGoogleCalendarEventsReal(startDate, endDate) {
+  // list calendars and find the one with the name "punchcard"
+  const calendar = await findCalendarByRegex(/punchcard/i);
+  if (!calendar) {
+    throw new Error("No calendar found with the name 'punchcard'");
+  }
+  const calendarId = calendar.id;
+  const response = await gapi.client.calendar.events.list({
+    calendarId: calendarId,
+    timeMin: startDate.toISOString(),
+    timeMax: endDate.toISOString(),
+    singleEvents: true,
+    orderBy: "startTime",
+  });
+  return response.result.items.map((event) => ({
+    title: event.summary,
+    date: [
+      event.start.dateTime || event.start.date,
+      event.end.dateTime || event.end.date,
+    ],
+  }));
+}
+
+async function findCalendarByRegex(regex) {
+  const response = await gapi.client.calendar.calendarList.list();
+  const calendars = response.result.items;
+  for (const calendar of calendars) {
+    if (regex.test(calendar.summary)) {
+      return calendar;
+    }
+  }
+  return null; // No matching calendar found
+}
+
+async function fetchGoogleCalendarEventsFake(startDate, endDate) {
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      resolve([
+        {
+          title: "[v1] [meeting] ACHQC Data",
+          date: ["2025-07-01T00:00:00Z", "2025-07-01T23:59:59Z"],
+        },
+        {
+          title: "[v1] [pd] DOS",
+          date: ["2025-07-02T14:15:00Z", "2025-07-02T15:00:00Z"],
+        },
+        {
+          title: "[v2] [meeting] Standup",
+          date: ["2025-07-03T14:15:00Z", "2025-07-03T15:00:00Z"],
+        },
+        {
+          title: "[v2] [pd] Project X",
+          date: ["2025-07-04T14:15:00Z", "2025-07-04T15:00:00Z"],
+        },
+        {
+          title: "[v1] [meeting] Sprint Planning",
+          date: ["2025-07-05T14:15:00Z", "2025-07-05T15:00:00Z"],
+        },
+        {
+          title: "[v1] [pd] Feature Y",
+          date: ["2025-07-06T14:15:00Z", "2025-07-06T15:00:00Z"],
+        },
+        {
+          title: "[v1] [meeting] Retrospective",
+          date: ["2025-07-07T14:15:00Z", "2025-07-07T15:00:00Z"],
+        },
+        {
+          title: "[v1] [pd] Bug Fixes",
+          date: ["2025-07-08T14:15:00Z", "2025-07-08T15:00:00Z"],
+        },
+      ]);
+    }, 1000); // Simulate network delay
+  });
 }
