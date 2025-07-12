@@ -2,11 +2,25 @@ export {};
 
 const html = String.raw;
 class LoginWithGoogle extends HTMLElement {
+  // ——— Replace these with your real values ———
+  static CLIENT_ID =
+    "1016583805708-6f9si6f88jcv7v8novm336he5ngvjg0s.apps.googleusercontent.com";
+  static API_KEY = "AIzaSyBA--9PYfcnM2k_Lgk0t31t3oWvpJigv_M";
+  static DISCOVERY_DOCS = [
+    "https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest",
+  ];
+  static SCOPES = "https://www.googleapis.com/auth/calendar.events";
+
   #loading = true;
   #user = null;
+  #gapiReady = false;
+  #tokenClient = null;
+
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
+
+    // 1) Watch Firebase auth
     firebase.auth().onAuthStateChanged((user) => {
       this.#loading = false;
       this.#user = user;
@@ -16,9 +30,12 @@ class LoginWithGoogle extends HTMLElement {
           detail: user,
           bubbles: true,
           composed: true,
-        })
+        }),
       );
+      // If everything else is ready, kick off token request:
+      this._maybeRequestAccessToken();
     });
+
     this.shadowRoot.innerHTML = html`
       <style>
         :host {
@@ -28,7 +45,6 @@ class LoginWithGoogle extends HTMLElement {
           font-family: Arial, sans-serif;
           width: 100%;
           padding: 10px;
-          box-sizing: border-box;
         }
         button {
           padding: 8px 12px;
@@ -48,32 +64,110 @@ class LoginWithGoogle extends HTMLElement {
       <div id="content"></div>
     `;
   }
+
   connectedCallback() {
     this.render();
+    this._initGapiClient();
+    this._initGis();
   }
-  render() {
-    if (this.#loading) {
-      this.renderLoading();
-      return;
-    } else if (!this.#user) {
-      this.renderLogin();
-      return;
-    } else {
-      this.renderLogout();
-      return;
-    }
-  }
-  renderLoading() {
-    this.renderContent(`<p>Loading...</p>`);
-  }
-  renderLogin() {
-    this.renderContent(html` <button id="login">Login with Google</button> `);
-    this.shadowRoot.querySelector("#login").addEventListener("click", () => {
-      firebase.auth().signInWithPopup(new firebase.auth.GoogleAuthProvider());
+
+  // ——— load & init gapi.client ———
+  _initGapiClient() {
+    gapi.load("client", () => {
+      gapi.client
+        .init({
+          apiKey: LoginWithGoogle.API_KEY,
+          discoveryDocs: LoginWithGoogle.DISCOVERY_DOCS,
+        })
+        .then(() => {
+          this.#gapiReady = true;
+          console.log("🟢 gapi.client ready");
+          this._maybeRequestAccessToken();
+        })
+        .catch((err) => console.error("❌ gapi.client.init error", err));
     });
   }
-  renderLogout() {
-    this.renderContent(html`
+
+  // ——— load & init GIS ———
+  _initGis() {
+    // load script if needed
+    if (!window.google?.accounts?.id) {
+      const s = document.createElement("script");
+      s.src = "https://accounts.google.com/gsi/client";
+      s.async = true;
+      s.defer = true;
+      s.onload = () => this._initGis();
+      document.head.appendChild(s);
+      return;
+    }
+
+    // ID-token → callback
+    google.accounts.id.initialize({
+      client_id: LoginWithGoogle.CLIENT_ID,
+      callback: (resp) => this._handleCredentialResponse(resp),
+    });
+
+    // prepare access-token client
+    this.#tokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: LoginWithGoogle.CLIENT_ID,
+      scope: LoginWithGoogle.SCOPES,
+      callback: (tokenResp) => this._handleTokenResponse(tokenResp),
+    });
+
+    console.log("🟢 GIS ready, tokenClient:", this.#tokenClient);
+    this._maybeRequestAccessToken();
+  }
+
+  // ——— if user + gapi + tokenClient are all set, request the token ———
+  _maybeRequestAccessToken() {
+    if (this.#user && this.#gapiReady && this.#tokenClient) {
+      console.log("➡️ Already logged in – requesting Calendar token");
+      this.#tokenClient.requestAccessToken({ prompt: "" });
+    }
+  }
+
+  render() {
+    if (this.#loading) return this._renderLoading();
+    else if (!this.#user) return this._renderLogin();
+    else return this._renderLogout();
+  }
+
+  _renderLoading() {
+    this._renderContent(`<p>Loading...</p>`);
+  }
+
+  _renderLogin() {
+    this._renderContent(`<div id="gis-button"></div>`);
+    google.accounts.id.renderButton(
+      this.shadowRoot.getElementById("gis-button"),
+      { theme: "outline", size: "large" },
+    );
+    google.accounts.id.prompt(); // optional one-tap
+  }
+
+  async _handleCredentialResponse(response) {
+    console.log("➡️ Got ID token", response);
+    const idToken = response.credential;
+    const cred = firebase.auth.GoogleAuthProvider.credential(idToken);
+    const { user } = await firebase.auth().signInWithCredential(cred);
+    // Firebase onAuthStateChanged will fire, calling _maybeRequestAccessToken()
+  }
+
+  _handleTokenResponse(tokenResponse) {
+    console.log("⬅️ Received access token", tokenResponse);
+    const accessToken = tokenResponse.access_token;
+    gapi.client.setToken({ access_token: accessToken });
+    this.dispatchEvent(
+      new CustomEvent("gapi-login", {
+        detail: { user: this.#user, accessToken },
+        bubbles: true,
+        composed: true,
+      }),
+    );
+  }
+
+  _renderLogout() {
+    this._renderContent(/* html */ `
       <div id="user-info">
         <div>
           <div>${this.#user.displayName}</div>
@@ -82,18 +176,20 @@ class LoginWithGoogle extends HTMLElement {
         <button id="logout">Logout</button>
       </div>
     `);
-    this.shadowRoot.querySelector("#logout").addEventListener("click", () => {
-      firebase.auth().signOut();
-    });
+    this.shadowRoot
+      .getElementById("logout")
+      .addEventListener("click", () => firebase.auth().signOut());
   }
-  renderContent(content) {
-    this.shadowRoot.querySelector("#content").innerHTML = content;
+
+  _renderContent(htmlStr) {
+    this.shadowRoot.getElementById("content").innerHTML = htmlStr;
   }
 }
 customElements.define("login-with-google", LoginWithGoogle);
 
 class PunchcardApp extends HTMLElement {
   #user = null;
+  #gapiReady = false;
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
@@ -112,7 +208,7 @@ class PunchcardApp extends HTMLElement {
     this.render();
   }
   render() {
-    if (!this.#user) {
+    if (!this.#user || !this.#gapiReady) {
       this.renderContent("<p>Please log in to continue.</p>");
       return;
     }
@@ -124,16 +220,17 @@ class PunchcardApp extends HTMLElement {
   }
   set user(user) {
     this.#user = user;
-    // configure gapi client
-    if (user) {
-      gapi.load("client", () => {
-        gapi.client.init({});
-      });
-    }
     this.render();
   }
   get user() {
     return this.#user;
+  }
+  set gapiReady(ready) {
+    this.#gapiReady = ready;
+    this.render();
+  }
+  get gapiReady() {
+    return this.#gapiReady;
   }
 }
 customElements.define("punchcard-app", PunchcardApp);
@@ -181,13 +278,21 @@ class CalendarSummary extends HTMLElement {
           font-size: 14px;
         }
       </style>
+      <h2>Events by Tag (calendar: &quot;punchcard&quot;)</h2>
+      <div class="date-range">
+        <input type="date" id="start-date" disabled />
+        <input type="date" id="end-date" disabled />
+        <button id="refresh">Refresh</button>
+      </div>
       <div id="content"></div>
     `;
     this.render();
   }
   connectedCallback() {
-    this.fetchCalendarData(oneMonthAgo(), today());
     this.render();
+    setTimeout(() => {
+      this.fetchCalendarData(oneMonthAgo(), today());
+    }, 0);
   }
   disconnectedCallback() {
     // Cleanup if needed
@@ -197,10 +302,19 @@ class CalendarSummary extends HTMLElement {
     const startDateEl = this.shadowRoot.querySelector("#start-date");
     const endDateEl = this.shadowRoot.querySelector("#end-date");
     if (!startDate) {
-      startDate = new Date(startDateEl?.value) || oneMonthAgo();
+      if (startDateEl?.value) {
+        startDate = new Date(startDateEl.value);
+      } else {
+        startDate = oneMonthAgo();
+      }
     }
     if (!endDate) {
-      endDate = new Date(endDateEl?.value) || today();
+      if (endDateEl?.value) {
+        console.log("Using endDateEl value:", endDateEl.value);
+        endDate = new Date(endDateEl.value);
+      } else {
+        endDate = today();
+      }
     }
     if (startDateEl) {
       startDateEl.value = startDate.toISOString().split("T")[0];
@@ -208,6 +322,10 @@ class CalendarSummary extends HTMLElement {
     if (endDateEl) {
       endDateEl.value = endDate.toISOString().split("T")[0];
     }
+    console.log("Fetching calendar data from", startDate, "to", endDate, {
+      startDateEl,
+      endDateEl,
+    });
     this.render();
     fetchGoogleCalendarEvents(startDate, endDate)
       .then((events) => {
@@ -230,7 +348,7 @@ class CalendarSummary extends HTMLElement {
       return;
     } else if (this.#error) {
       this.renderContent(
-        "<p>Error loading calendar data. Please try again later.</p>"
+        "<p>Error loading calendar data. Please try again later.</p>",
       );
       return;
     } else if (!this.#events) {
@@ -250,37 +368,26 @@ class CalendarSummary extends HTMLElement {
   renderEvents() {
     const events = this.#events;
     const summary = calculateSummary(events);
-    const content = summary
-      .map((tag) => {
-        const descriptionsByCount = Object.entries(tag.descriptions);
-        descriptionsByCount.sort((a, b) => b[1] - a[1]);
-        const descriptions = descriptionsByCount.map(
-          ([description, count]) => `${description} (${count})`
-        );
-        const suffix =
-          descriptions.length > 3 ? `, ${descriptions.length - 3} more` : "";
-        return html`<div class="tag">
-          <div class="tag-title">
-            ${tag.title} ${tag.total.toFixed(1)}hrs ${tag.count}
-          </div>
-          <div class="descriptions">${descriptions.slice(0, 3)}${suffix}</div>
-        </div>`;
-      })
-      .join("");
-    this.renderContent(html`
-      <div id="summary">
-        <h2>Events by Tag (calendar: &quot;punchcard&quot;)</h2>
-        <div class="date-range">
-          <input type="date" id="start-date" disabled />
-          <input type="date" id="end-date" disabled />
-          <button id="refresh">Refresh</button>
-        </div>
-        ${content}
-      </div>
-    `);
+    const content = summary.map(this.renderTag.bind(this)).join("");
+    this.renderContent(html` <div id="summary">${content}</div> `);
     this.shadowRoot.querySelector("#refresh").addEventListener("click", () => {
       this.fetchCalendarData();
     });
+  }
+  renderTag(tag) {
+    const descriptionsByCount = Object.entries(tag.descriptions);
+    descriptionsByCount.sort((a, b) => b[1] - a[1]);
+    const descriptions = descriptionsByCount.map(
+      ([description, count]) => `${description} (${count})`,
+    );
+    const suffix =
+      descriptions.length > 3 ? `, ${descriptions.length - 3} more` : "";
+    return html`<div class="tag">
+      <div class="tag-title">
+        ${tag.title} ${tag.total.toFixed(1)}hrs ${tag.count}
+      </div>
+      <div class="descriptions">${descriptions.slice(0, 3)}${suffix}</div>
+    </div>`;
   }
   renderContent(content) {
     this.shadowRoot.querySelector("#content").innerHTML = content;
@@ -297,6 +404,11 @@ document.addEventListener("DOMContentLoaded", function () {
       loadEl.textContent = "";
       appEl.user = e.detail;
     });
+    userEl.addEventListener("gapi-login", (e) => {
+      loadEl.textContent = "";
+      appEl.gapiReady = true;
+      appEl.user = e.detail.user;
+    });
   } catch (e) {
     console.error(e);
     loadEl.textContent = "Error loading the Firebase SDK, check the console.";
@@ -309,6 +421,10 @@ function calculateSummary(events) {
     const tagRegex = /\[([^\]]+)\]/g;
     const tags = event.title.match(tagRegex);
     const description = event.title.replace(tagRegex, "").trim();
+    if (!tags || tags.length === 0) {
+      console.warn("No tags found in event title:", event.title);
+      return;
+    }
     try {
       const minDate = new Date(event.date[0]);
       const maxDate = new Date(event.date[1]);
@@ -334,7 +450,7 @@ function calculateSummary(events) {
         }
       });
     } catch (e) {
-      console.error("Invalid date format in event:", event);
+      console.error("Invalid date format in event:", event, e);
       return;
     }
   });
@@ -392,40 +508,57 @@ async function fetchGoogleCalendarEvents(startDate, endDate) {
   return fetchGoogleCalendarEventsReal(startDate, endDate);
 }
 
-async function fetchGoogleCalendarEventsReal(startDate, endDate) {
-  // list calendars and find the one with the name "punchcard"
-  const calendar = await findCalendarByRegex(/punchcard/i);
-  if (!calendar) {
-    throw new Error("No calendar found with the name 'punchcard'");
-  }
-  const calendarId = calendar.id;
-  const response = await gapi.client.calendar.events.list({
-    calendarId: calendarId,
-    timeMin: startDate.toISOString(),
-    timeMax: endDate.toISOString(),
-    singleEvents: true,
-    orderBy: "startTime",
-  });
-  return response.result.items.map((event) => ({
-    title: event.summary,
-    date: [
-      event.start.dateTime || event.start.date,
-      event.end.dateTime || event.end.date,
-    ],
-  }));
-}
-
+/**
+ * Finds the first calendar whose summary matches the given regex.
+ * @param {RegExp} regex
+ * @returns {gapi.client.calendar.CalendarListEntry|null}
+ */
 async function findCalendarByRegex(regex) {
-  const response = await gapi.client.calendar.calendarList.list();
-  const calendars = response.result.items;
-  for (const calendar of calendars) {
-    if (regex.test(calendar.summary)) {
-      return calendar;
-    }
+  try {
+    const resp = await gapi.client.calendar.calendarList.list();
+    const calendars = resp.result.items || [];
+    return calendars.find((cal) => regex.test(cal.summary)) || null;
+  } catch (err) {
+    console.error("Error finding calendar", err);
+    return null;
   }
-  return null; // No matching calendar found
 }
 
+/**
+ * Fetches events from the “punchcard” calendar between startDate and endDate,
+ * returning an array of { title, date: [start, end] }.
+ * @param {Date} startDate
+ * @param {Date} endDate
+ * @throws if no “punchcard” calendar is found
+ */
+async function fetchGoogleCalendarEventsReal(startDate, endDate) {
+  try {
+    const calendar = await findCalendarByRegex(/punchcard/i);
+    if (!calendar) {
+      throw new Error("No calendar found with the name 'punchcard'");
+    }
+
+    const resp = await gapi.client.calendar.events.list({
+      calendarId: calendar.id,
+      timeMin: startDate.toISOString(),
+      timeMax: endDate.toISOString(),
+      singleEvents: true,
+      orderBy: "startTime",
+    });
+
+    const items = resp.result.items || [];
+    return items.map((event) => ({
+      title: event.summary,
+      date: [
+        event.start.dateTime || event.start.date,
+        event.end.dateTime || event.end.date,
+      ],
+    }));
+  } catch (err) {
+    console.error("Error fetching punchcard events", err);
+    throw err;
+  }
+}
 async function fetchGoogleCalendarEventsFake(startDate, endDate) {
   return new Promise((resolve) => {
     setTimeout(() => {
