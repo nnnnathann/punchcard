@@ -2,7 +2,6 @@ export {};
 
 const html = String.raw;
 class LoginWithGoogle extends HTMLElement {
-  // ——— Replace these with your real values ———
   static CLIENT_ID =
     "1016583805708-6f9si6f88jcv7v8novm336he5ngvjg0s.apps.googleusercontent.com";
   static DISCOVERY_DOCS = [
@@ -213,7 +212,7 @@ class PunchcardApp extends HTMLElement {
 customElements.define("punchcard-app", PunchcardApp);
 
 class CalendarSummary extends HTMLElement {
-  #loading = true;
+  #loading = false;
   #error = false;
   #events = null;
   constructor() {
@@ -227,6 +226,8 @@ class CalendarSummary extends HTMLElement {
           padding: 10px;
           border: 1px solid #ccc;
           margin-top: 10px;
+          background: white;
+          border-radius: 5px;
         }
         #summary {
           font-size: 16px;
@@ -257,9 +258,9 @@ class CalendarSummary extends HTMLElement {
       </style>
       <h2>Events by Tag (calendar: &quot;punchcard&quot;)</h2>
       <div class="date-range">
-        <input type="date" id="start-date" disabled />
-        <input type="date" id="end-date" disabled />
-        <button id="refresh">Refresh</button>
+        <input type="date" id="start-date" />
+        <input type="date" id="end-date" />
+        <button id="refresh">Update</button>
       </div>
       <div id="content"></div>
     `;
@@ -267,14 +268,24 @@ class CalendarSummary extends HTMLElement {
   }
   connectedCallback() {
     this.render();
+    this.shadowRoot
+      .querySelector("#refresh")
+      .addEventListener("click", this.refresh.bind(this));
     setTimeout(() => {
       this.fetchCalendarData(oneMonthAgo(), today());
     }, 0);
+  }
+  refresh() {
+    this.fetchCalendarData();
   }
   disconnectedCallback() {
     // Cleanup if needed
   }
   fetchCalendarData(startDate, endDate) {
+    if (this.#loading) {
+      console.warn("Already loading calendar data, ignoring new request.");
+      return;
+    }
     this.#loading = true;
     const startDateEl = this.shadowRoot.querySelector("#start-date");
     const endDateEl = this.shadowRoot.querySelector("#end-date");
@@ -299,10 +310,6 @@ class CalendarSummary extends HTMLElement {
     if (endDateEl) {
       endDateEl.value = endDate.toISOString().split("T")[0];
     }
-    console.log("Fetching calendar data from", startDate, "to", endDate, {
-      startDateEl,
-      endDateEl,
-    });
     this.render();
     fetchGoogleCalendarEvents(startDate, endDate)
       .then((events) => {
@@ -347,9 +354,6 @@ class CalendarSummary extends HTMLElement {
     const summary = calculateSummary(events);
     const content = summary.map(this.renderTag.bind(this)).join("");
     this.renderContent(html` <div id="summary">${content}</div> `);
-    this.shadowRoot.querySelector("#refresh").addEventListener("click", () => {
-      this.fetchCalendarData();
-    });
   }
   renderTag(tag) {
     const descriptionsByCount = Object.entries(tag.descriptions);
@@ -360,9 +364,9 @@ class CalendarSummary extends HTMLElement {
     const suffix =
       descriptions.length > 3 ? `, ${descriptions.length - 3} more` : "";
     return html`<div class="tag">
-      <div class="tag-title">
-        ${tag.title} ${tag.total.toFixed(1)}hrs ${tag.count}
-      </div>
+      <div class="tag-title">${tag.title.replace(/\[|\]/g, "")}</div>
+      <div class="hrs">${Math.round(tag.total)}hrs</div>
+      <div class="count">${tag.count} Events</div>
       <div class="descriptions">${descriptions.slice(0, 3)}${suffix}</div>
     </div>`;
   }
@@ -407,13 +411,13 @@ function calculateSummary(events) {
       const maxDate = new Date(event.date[1]);
       const minTime = Math.min(minDate.getTime(), maxDate.getTime());
       const maxTime = Math.max(minDate.getTime(), maxDate.getTime());
-      const permutations = getPermutations(tags);
+      const permutations = getPermutations(deduplicate(tags));
       permutations.forEach((t) => {
         const existing = tagSets.get(t);
-        const total = (maxTime - minTime) / (1000 * 60 * 60 * 24) + 1;
+        const durationInHrs = (maxTime - minTime) / (1000 * 60 * 60);
         if (existing) {
           existing.count++;
-          existing.total += total;
+          existing.total += durationInHrs;
           existing.descriptions[description] =
             (existing.descriptions[description] || 0) + 1;
           tagSets.set(t, existing);
@@ -421,7 +425,7 @@ function calculateSummary(events) {
           tagSets.set(t, {
             title: t,
             count: 1,
-            total: total,
+            total: durationInHrs,
             descriptions: { [description]: 1 },
           });
         }
@@ -432,10 +436,10 @@ function calculateSummary(events) {
     }
   });
   return Array.from(tagSets.values()).sort((a, b) => {
-    if (a.count !== b.count) {
-      return b.count - a.count; // Sort by count descending
+    if (a.total !== b.total) {
+      return b.total - a.total;
     }
-    return b.total - a.total; // If counts are equal, sort by total descending
+    return b.count - a.count;
   });
 }
 
@@ -460,6 +464,13 @@ function getPermutations(tags) {
   }
   return Array.from(results);
 }
+
+function deduplicate(arr) {
+  const seen = new Set(arr);
+  return Array.from(seen.values());
+}
+
+window.getPermutations = getPermutations;
 
 function startOfThisMonth() {
   const date = new Date();
@@ -502,8 +513,9 @@ async function findCalendarByRegex(regex) {
 }
 
 /**
- * Fetches events from the “punchcard” calendar between startDate and endDate,
- * returning an array of { title, date: [start, end] }.
+ * Fetches **all** events from the “punchcard” calendar between startDate and endDate,
+ * handling pagination so you get beyond the first page of results.
+ * Returns an array of { title, date: [start, end] }.
  * @param {Date} startDate
  * @param {Date} endDate
  * @throws if no “punchcard” calendar is found
@@ -515,27 +527,39 @@ async function fetchGoogleCalendarEventsReal(startDate, endDate) {
       throw new Error("No calendar found with the name 'punchcard'");
     }
 
-    const resp = await gapi.client.calendar.events.list({
-      calendarId: calendar.id,
-      timeMin: startDate.toISOString(),
-      timeMax: endDate.toISOString(),
-      singleEvents: true,
-      orderBy: "startTime",
-    });
+    let allItems = [];
+    let pageToken = undefined;
 
-    const items = resp.result.items || [];
-    return items.map((event) => ({
-      title: event.summary,
-      date: [
-        event.start.dateTime || event.start.date,
-        event.end.dateTime || event.end.date,
-      ],
-    }));
+    do {
+      const resp = await gapi.client.calendar.events.list({
+        calendarId: calendar.id,
+        timeMin: startDate.toISOString(),
+        timeMax: endDate.toISOString(),
+        singleEvents: true,
+        orderBy: "startTime",
+        pageToken: pageToken,
+      });
+
+      const items = resp.result.items || [];
+      allItems = allItems.concat(items);
+      pageToken = resp.result.nextPageToken;
+    } while (pageToken);
+
+    return allItems.map((event) => {
+      let dateRange = [event.start.dateTime, event.end.dateTime].map(
+        (d) => new Date(d),
+      );
+      return {
+        title: event.summary,
+        date: dateRange,
+      };
+    });
   } catch (err) {
     console.error("Error fetching punchcard events", err);
     throw err;
   }
 }
+
 async function fetchGoogleCalendarEventsFake(startDate, endDate) {
   return new Promise((resolve) => {
     setTimeout(() => {
